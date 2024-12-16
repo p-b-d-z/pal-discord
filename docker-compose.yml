@@ -1,0 +1,7 @@
+services:
+    paldiscord:
+      image: paldiscord:latest
+      container_name: paldiscord
+      env_file:
+          - .env
+      restart: unless-stopped

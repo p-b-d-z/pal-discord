@@ -1,0 +1,10 @@
+*.pyc
+*.swp
+*.DS_Store
+*.vscode
+.pycharm/*
+.idea/*
+**/*.min.json
+venv
+__pycache__/*
+.env

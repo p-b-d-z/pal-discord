@@ -1,0 +1,6 @@
+.idea/*
+**/*.min.json
+venv
+Jenkinsfile
+.gitignore
+.env
