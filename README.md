@@ -7,6 +7,25 @@ Now it's a framework I use for automation within chat apps like Discord, and Sla
 This bot is under development and is provided as-is. The goal with this project is to leverage paid-for AI LLMs in Discord.
 
 # Configuration
+Create a `.env` file with the following variables. I personally use Perplexity and Akash. Akash is a free OpenAI-compatible Chat API.
+
+```bash
+LOG_LEVEL=debug
+ENVIRONMENT=home
+REGION=local
+VERSION=1.0.0
+# Perplexity
+OPENAI_API_KEY=''
+OPENAI_BASE_URL='https://api.perplexity.ai'
+OPENAI_MODEL='llama-3.1-8b-instruct'
+# Akash
+AKASH_API_KEY=''
+AKASH_BASE_URL='https://chatapi.akash.network/api/v1'
+AKASH_MODEL='DeepSeek-R1'
+# Discord
+DISCORD_TOKEN=''
+```
+
 A Python dictionary is used to define channel settings. This allows you to set the model and system prompt per channel.
 ```python
 # Optionally set openai model at runtime
