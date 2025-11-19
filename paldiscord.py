@@ -8,7 +8,11 @@ import asyncio
 import os
 import discord
 import re
+import tempfile
+import yt_dlp
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
+from typing import List, cast
 import palpersonalities
 
 # Load environment variables
@@ -110,12 +114,15 @@ async def handle_message(event):
         selected_client = openai_client
 
     try:
+        messages = [
+            cast(ChatCompletionSystemMessageParam,
+                 cast(object, {'role': 'system', 'content': channel_prompt + system_prompt_footer})),
+            cast(ChatCompletionUserMessageParam,
+                 cast(object, {'role': 'user', 'content': message_text + channel_history})),
+        ]
         response = await selected_client.chat.completions.create(
             model=channel_model,
-            messages=[
-                {'role': 'system', 'content': channel_prompt + system_prompt_footer},
-                {'role': 'user', 'content': message_text + channel_history},
-            ],
+            messages=messages,
             max_tokens=1024,
             temperature=0.7,
         )
@@ -186,12 +193,13 @@ async def provide_judgement(event):
                 else:
                     selected_client = openai_client
 
+                judge_messages = [
+                    cast(ChatCompletionSystemMessageParam, cast(object, {'role': 'system', 'content': judge['prompt']})),
+                    cast(ChatCompletionUserMessageParam, cast(object, {'role': 'user', 'content': message_text})),
+                ]
                 response = await selected_client.chat.completions.create(
                     model=judge['openai_model'],
-                    messages=[
-                        {'role': 'system', 'content': judge['prompt']},
-                        {'role': 'user', 'content': message_text},
-                    ],
+                    messages=judge_messages,
                     max_tokens=512,
                     temperature=judge['temperature'],
                 )
@@ -219,12 +227,14 @@ async def provide_judgement(event):
             else:
                 selected_client = openai_client
 
+            final_messages = [
+                cast(ChatCompletionSystemMessageParam,
+                     cast(object, {'role': 'system', 'content': final_judge['prompt']})),
+                cast(ChatCompletionUserMessageParam, cast(object, {'role': 'user', 'content': judgement_context})),
+            ]
             judgement_response = await selected_client.chat.completions.create(
                 model=final_judge['openai_model'],
-                messages=[
-                    {'role': 'system', 'content': final_judge['prompt']},
-                    {'role': 'user', 'content': judgement_context},
-                ],
+                messages=final_messages,
                 max_tokens=512,
                 temperature=final_judge['temperature'],
             )
@@ -272,6 +282,68 @@ async def remove_think_tags(text):
     return re.sub(pattern, '', text, flags=re.DOTALL)
 
 
+def is_youtube_url(text):
+    """
+    Check if the message contains a YouTube URL.
+    """
+    youtube_pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})'
+    return bool(re.search(youtube_pattern, text))
+
+
+async def download_youtube_as_mp3(url):
+    """
+    Download YouTube video and convert to MP3.
+    Returns the path to the MP3 file or None if failed.
+    """
+    try:
+        # Create temporary directory for download
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_template = os.path.join(temp_dir, '%(title)s.%(ext)s')
+
+            # yt-dlp options for MP3 conversion
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'outtmpl': output_template,
+                'quiet': True,
+                'no_warnings': True,
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Extract info first to get title
+                info = ydl.extract_info(url, download=False)
+                title = info.get('title', 'unknown')
+
+                # Download and convert
+                ydl.download([url])
+
+                # Find the generated MP3 file
+                mp3_filename = f'{title}.mp3'
+                mp3_path = os.path.join(temp_dir, mp3_filename)
+
+                if os.path.exists(mp3_path):
+                    # Check file size (Discord limit is 10MB)
+                    file_size = os.path.getsize(mp3_path)
+                    if file_size > 10 * 1024 * 1024:  # 10MB
+                        print(f'MP3 file too large: {file_size} bytes', flush=True)
+                        return None
+
+                    # Move to a persistent location for upload
+                    final_path = f'/tmp/{mp3_filename}'
+                    os.rename(mp3_path, final_path)
+                    return final_path
+
+        return None
+
+    except Exception as err:
+        print(f'Error downloading/converting YouTube video: {err}', flush=True)
+        return None
+
+
 @discord_client.event
 async def on_ready():
     print(f'{discord_client.user} has connected to Discord!', flush=True)
@@ -280,6 +352,7 @@ async def on_ready():
 
 @discord_client.event
 async def on_message(message):
+    event = {}
     if message.author == discord_client.user:
         # Loop avoidance.
         print('Ignoring a message from myself.', flush=True)
@@ -311,6 +384,36 @@ async def on_message(message):
         event.update({'channel_context': channel_context})
     except Exception as err:
         print(f'Unable to setup event dictionary: {err}', flush=True)
+
+    # Handle YouTube links
+    if is_youtube_url(message.content):
+        await message.add_reaction('🎵')
+        print('Processing YouTube link...\n', flush=True)
+
+        # Extract YouTube URL from message
+        youtube_urls = re.findall(r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})', message.content)
+        if youtube_urls:
+            youtube_url = f'https://youtu.be/{youtube_urls[0]}'
+            mp3_path = await download_youtube_as_mp3(youtube_url)
+
+            if mp3_path:
+                try:
+                    # Send the MP3 file
+                    await message.channel.send(file=discord.File(mp3_path))
+                    print(f'Successfully uploaded MP3: {mp3_path}', flush=True)
+                except Exception as err:
+                    print(f'Error uploading MP3: {err}', flush=True)
+                    await message.channel.send('Sorry, there was an error uploading the MP3 file.')
+                finally:
+                    # Clean up the temporary file
+                    try:
+                        os.remove(mp3_path)
+                    except:
+                        pass
+            else:
+                await message.channel.send('Sorry, I couldn\'t convert that YouTube video to MP3. It might be too long or unavailable.')
+
+        return
 
     if message.content.startswith('guidance:'):
         await message.add_reaction('👍')

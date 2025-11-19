@@ -7,6 +7,8 @@ websockets
 openai
 # Discord
 discord.py>=2.3.2
+# YouTube processing
+yt-dlp
 # Linting
 pre-commit
 pylint

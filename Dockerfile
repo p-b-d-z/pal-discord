@@ -14,7 +14,7 @@ ENV VERSION="unknown"
 RUN addgroup -g 1000 palbot
 RUN adduser -u 1000 -G palbot -h /home/palbot -D palbot
 RUN apk -U upgrade
-RUN apk add --no-cache bash build-base libffi-dev python3-dev gcompat patchelf
+RUN apk add --no-cache bash build-base libffi-dev python3-dev gcompat patchelf ffmpeg
 
 COPY ./requirements.txt /tmp/requirements.txt
 COPY ./*.py /etc/palbot/
