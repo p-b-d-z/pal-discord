@@ -1,8 +1,14 @@
 # Required by PAL
 aiohttp>=3.9.2
 requests>=2.31.0
+slack_sdk
+websockets
 # AI i i i i i i i i
 openai
 # Discord
-discord
-audioop-lts
+discord.py>=2.3.2
+# Linting
+pre-commit
+pylint
+ruff
+
