@@ -5,14 +5,16 @@ Available models
   Perplexity: https://docs.perplexity.ai/guides/model-cards
 """
 import asyncio
+import hashlib
 import os
-import discord
 import re
 import tempfile
+
 import yt_dlp
+import discord
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
-from typing import List, cast
+from typing import cast
 import palpersonalities
 
 # Load environment variables
@@ -82,13 +84,23 @@ system_prompt_dict = {
 }
 
 
+def format_audio_file(string):
+    string = string.replace(' ', '_').replace('$', '').lower()
+    string = string.replace('(', '').replace(')', '')
+    string = string.replace('{', '').replace('}', '')
+    string = string.replace('[', '').replace(']', '')
+    string = string.replace('.', '').replace(',', '')
+    string = string.replace('\\', '').replace("'", '').replace('"', '').replace('|', '')
+    return string
+
+
 async def generate_system_prompt_metadata(event):
     """
     Take the event dictionary we are passed and generate a system-prompt header for this event.
     """
     channel_name = event.get('channel_name')
     server_name = event.get('server_name')
-    system_prompt = f'# Begin Context: Discord Metadata'
+    system_prompt = '# Begin Context: Discord Metadata'
     system_prompt += f'\nChannel: {channel_name}\nServer: {server_name}'
     if bool(event.get('is_bot', False)):
         system_prompt += '\nYou are communicating with another bot.'
@@ -115,10 +127,8 @@ async def handle_message(event):
 
     try:
         messages = [
-            cast(ChatCompletionSystemMessageParam,
-                 cast(object, {'role': 'system', 'content': channel_prompt + system_prompt_footer})),
-            cast(ChatCompletionUserMessageParam,
-                 cast(object, {'role': 'user', 'content': message_text + channel_history})),
+            {'role': 'system', 'content': channel_prompt + system_prompt_footer},
+            {'role': 'user', 'content': message_text + channel_history},
         ]
         response = await selected_client.chat.completions.create(
             model=channel_model,
@@ -136,7 +146,7 @@ async def handle_message(event):
 
         is_refusal = bool(response.choices[0].message.refusal)
         if is_refusal:
-            print(f'DEBUG Model has refused to answer this prompt: {response.choices[0].message.refusal}')
+            print(f'DEBUG Model has refused to answer this prompt: {response.choices[0].message.refusal}', flush=True)
         try:
             citations = response.citations
         except:
@@ -194,8 +204,8 @@ async def provide_judgement(event):
                     selected_client = openai_client
 
                 judge_messages = [
-                    cast(ChatCompletionSystemMessageParam, cast(object, {'role': 'system', 'content': judge['prompt']})),
-                    cast(ChatCompletionUserMessageParam, cast(object, {'role': 'user', 'content': message_text})),
+                    {'role': 'system', 'content': judge['prompt']},
+                    {'role': 'user', 'content': message_text},
                 ]
                 response = await selected_client.chat.completions.create(
                     model=judge['openai_model'],
@@ -290,58 +300,72 @@ def is_youtube_url(text):
     return bool(re.search(youtube_pattern, text))
 
 
-async def download_youtube_as_mp3(url):
+async def download_youtube_as_audio_only(url, start_quality='192'):
     """
-    Download YouTube video and convert to MP3.
-    Returns the path to the MP3 file or None if failed.
+    Download YouTube video and convert to audio file.
+    Returns the path to the audio file or None if failed.
     """
-    try:
-        # Create temporary directory for download
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_template = os.path.join(temp_dir, '%(title)s.%(ext)s')
+    print(f'Starting YouTube download for URL: {url}', flush=True)
+    qualities = ['192', '128'] if start_quality == '192' else ['128', '192']
+    for quality in qualities:
+        try:
+            # Create temporary directory for download
+            with tempfile.TemporaryDirectory() as temp_dir:
+                random_bytes = os.urandom(32)
+                hash_value = hashlib.sha256(random_bytes).hexdigest()
+                output_path = os.path.join(temp_dir, hash_value)
+                # yt-dlp options for audio file conversion
+                ydl_ext = 'm4a'
+                ydl_opts = {
+                    'format': 'm4a/bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': ydl_ext,
+                        'preferredquality': quality,
+                    }],
+                    'outtmpl': output_path,
+                    'quiet': False,
+                    'no_warnings': True,
+                }
 
-            # yt-dlp options for MP3 conversion
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'outtmpl': output_template,
-                'quiet': True,
-                'no_warnings': True,
-            }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Extract info first to get title
+                    print(f'Extracting video info for quality {quality}...', flush=True)
+                    info = ydl.extract_info(url, download=False)
+                    title = info.get('title', 'unknown')
+                    print(f'Video title: {title}', flush=True)
+                    # Download and convert
+                    print(f'Downloading and converting with quality {quality}...', flush=True)
+                    ydl.download([url])
+                    print(f'Download and conversion completed for quality {quality}', flush=True)
+                    print(f'Temporary path: {output_path}', flush=True)
+                    extracted_audio_path = output_path + f'.{ydl_ext}'
+                    if os.path.exists(extracted_audio_path):
+                        # Check file size (Discord limit is 10MB)
+                        file_size = os.path.getsize(extracted_audio_path)
+                        print(f'Generated file size: {file_size} bytes', flush=True)
+                        if file_size > 10 * 1024 * 1024:  # 10MB
+                            print(f'File too large ({file_size} bytes > 10MB), trying next quality', flush=True)
+                            continue  # Try next quality
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract info first to get title
-                info = ydl.extract_info(url, download=False)
-                title = info.get('title', 'unknown')
+                        # Move to a persistent location for upload
+                        title = format_audio_file(title)
+                        final_path = f'/tmp/{title}.{ydl_ext}'
+                        print(f'Moving audio file to: {final_path}', flush=True)
+                        os.rename(extracted_audio_path, final_path)
+                        return final_path
+                    else:
+                        print(f'Failed to locate download: {extracted_audio_path}', flush=True)
 
-                # Download and convert
-                ydl.download([url])
+            return None
 
-                # Find the generated MP3 file
-                mp3_filename = f'{title}.mp3'
-                mp3_path = os.path.join(temp_dir, mp3_filename)
+        except Exception as err:
+            print(f'Error downloading/converting YouTube video with quality {quality}: {err}', flush=True)
+            print(f'Failed URL: {url}', flush=True)
+            continue  # Try next quality
 
-                if os.path.exists(mp3_path):
-                    # Check file size (Discord limit is 10MB)
-                    file_size = os.path.getsize(mp3_path)
-                    if file_size > 10 * 1024 * 1024:  # 10MB
-                        print(f'MP3 file too large: {file_size} bytes', flush=True)
-                        return None
-
-                    # Move to a persistent location for upload
-                    final_path = f'/tmp/{mp3_filename}'
-                    os.rename(mp3_path, final_path)
-                    return final_path
-
-        return None
-
-    except Exception as err:
-        print(f'Error downloading/converting YouTube video: {err}', flush=True)
-        return None
+    print(f'All quality attempts failed for URL: {url}', flush=True)
+    return None
 
 
 @discord_client.event
@@ -386,43 +410,62 @@ async def on_message(message):
         print(f'Unable to setup event dictionary: {err}', flush=True)
 
     # Handle YouTube links
-    if is_youtube_url(message.content):
+    yt_conditions = [
+        bool(message.channel.name == 'music'),
+        bool(message.content.startswith('get ') or message.content.startswith('!get')),
+        bool(is_youtube_url(message.content)),
+    ]
+    if all(yt_conditions):
         await message.add_reaction('🎵')
         print('Processing YouTube link...\n', flush=True)
 
         # Extract YouTube URL from message
-        youtube_urls = re.findall(r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})', message.content)
+        yt_match_pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})'
+        youtube_urls = re.findall(yt_match_pattern, message.content)
         if youtube_urls:
             youtube_url = f'https://youtu.be/{youtube_urls[0]}'
-            mp3_path = await download_youtube_as_mp3(youtube_url)
+            audio_file_path = await download_youtube_as_audio_only(youtube_url)
 
-            if mp3_path:
+            if audio_file_path:
                 try:
-                    # Send the MP3 file
-                    await message.channel.send(file=discord.File(mp3_path))
-                    print(f'Successfully uploaded MP3: {mp3_path}', flush=True)
+                    await message.channel.send(file=discord.File(audio_file_path))
+                    print(f'Successfully uploaded audio file: {audio_file_path}', flush=True)
                 except Exception as err:
-                    print(f'Error uploading MP3: {err}', flush=True)
-                    await message.channel.send('Sorry, there was an error uploading the MP3 file.')
+                    print(f'Error uploading audio file with initial quality: {err}', flush=True)
+                    # Retry with lower quality (128)
+                    audio_file_path2 = await download_youtube_as_audio_only(youtube_url, start_quality='128')
+                    if audio_file_path2:
+                        try:
+                            await message.channel.send(file=discord.File(audio_file_path2))
+                            print(f'Successfully uploaded audio file on retry: {audio_file_path2}', flush=True)
+                        except Exception as err2:
+                            print(f'Error uploading audio file on retry: {err2}', flush=True)
+                            await message.channel.send('Sorry, there was an error uploading the audio file file.')
+                        finally:
+                            try:
+                                os.remove(audio_file_path2)
+                            except:
+                                pass
+                    else:
+                        await message.channel.send('Sorry, I couldn\'t convert that YouTube video to audio file. It might be too long or unavailable.')
                 finally:
-                    # Clean up the temporary file
                     try:
-                        os.remove(mp3_path)
+                        os.remove(audio_file_path)
                     except:
                         pass
             else:
-                await message.channel.send('Sorry, I couldn\'t convert that YouTube video to MP3. It might be too long or unavailable.')
+                await message.channel.send('Sorry, I couldn\'t convert that YouTube video to audio file. It might be too long or unavailable.')
 
         return
 
-    if message.content.startswith('guidance:'):
+    if message.content.startswith('guidance:') or message.content.startswith('!guidance'):
         await message.add_reaction('👍')
         print('Awaiting guidance...\n', flush=True)
         judgement_response = await provide_judgement(event)
         await send_message(message, judgement_response)
         return
 
-    if message.content.startswith('online:'):
+    if message.content.startswith('online:') or message.content.startswith('!online'):
         await message.add_reaction('👍')
         print('Searching the interwebs...\n', flush=True)
         event.update({'channel_model': 'sonar-pro'})
