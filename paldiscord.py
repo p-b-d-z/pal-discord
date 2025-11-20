@@ -55,12 +55,12 @@ channel_settings = {
     },
     'pal-akash-deepseek': {
         'openai_base_url': akash_base_url,
-        'openai_model': 'DeepSeek-R1',
+        'openai_model': 'DeepSeek-V3-1',
         'system_prompt': 'default',
     },
     'pal-akash-llama': {
         'openai_base_url': akash_base_url,
-        'openai_model': 'Meta-Llama-3-3-70B-Instruct',
+        'openai_model': 'Meta-Llama-4-Maverick-17B-128E-Instruct-FP8',
         'system_prompt': 'default',
     },
     'pal-online': {
