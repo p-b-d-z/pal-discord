@@ -94,6 +94,46 @@ def format_audio_file(string):
     return string
 
 
+def format_response(response: str) -> str:
+    """
+    Clean up AI response formatting to ensure Slack compatibility using regex patterns
+    """
+    if not response:
+        return response
+
+    # Remove common AI starting phrases
+    response = re.sub(r'^(Sure|Certainly|Got it),?\s+', '', response, flags=re.IGNORECASE)
+
+    # Replace bold Markdown formatting, preserving the text between markers
+    bold_pattern = r'\*\*(.+?)\*\*'
+    response = re.sub(bold_pattern, r'*\1*', response)
+
+    # Fix code block formatting, ensuring newlines around the content
+    bash_pattern = r'```bash\n'
+    response = re.sub(bash_pattern, r'```\n#!/bin/bash\n', response, flags=re.DOTALL)
+    python_pattern = r'```python\n'
+    response = re.sub(python_pattern, r'```\n#!/usr/bin/python3\n', response, flags=re.DOTALL)
+    other_pattern = r'```\w\n'
+    response = re.sub(other_pattern, r'```\n', response, flags=re.DOTALL)
+    # Catch all for code blocks
+    code_pattern = r'```(.*?)```'
+    response = re.sub(code_pattern, r'```\n\1\n```\n', response, flags=re.DOTALL)
+
+    # Fix URL formatting [text](url) -> <url|text>
+    url_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+    response = re.sub(url_pattern, r'<\2|\1>', response)
+
+    # Replace double line breaks with single line breaks
+    lb_pattern = r'\n\n'
+    response = re.sub(lb_pattern, r'\n', response, flags=re.DOTALL)
+
+    # Remove think tags
+    pattern = r'<think>.*?</think>'
+    response = re.sub(pattern, r'', response, flags=re.DOTALL)
+
+    return response.strip()
+
+
 async def generate_system_prompt_metadata(event):
     """
     Take the event dictionary we are passed and generate a system-prompt header for this event.
@@ -132,18 +172,13 @@ async def handle_message(event):
         ]
         response = await selected_client.chat.completions.create(
             model=channel_model,
-            messages=messages,
+            messages=messages,  # noqa
             max_tokens=1024,
             temperature=0.7,
         )
         # print(f'DEBUG Client response: {response}')
         result = response.choices[0].message.content
-        is_deepseek = bool('deepseek' in response.model)
-        is_reasoning_requested = bool('+reasoning' in message_text.lower())
-        if is_deepseek or not is_reasoning_requested:
-            print('DEBUG Removing <think></think> tags', flush=True)
-            result = await remove_think_tags(result)
-
+        result = format_response(result)
         is_refusal = bool(response.choices[0].message.refusal)
         if is_refusal:
             print(f'DEBUG Model has refused to answer this prompt: {response.choices[0].message.refusal}', flush=True)
@@ -171,7 +206,7 @@ async def handle_message(event):
 
 async def provide_judgement(event):
     message_text = event.get('message', '')
-    channel_model = event.get('channel_model', '')
+    # channel_model = event.get('channel_model', '')
     judges = [
         {
             'prompt': palpersonalities.conservative,
@@ -209,7 +244,7 @@ async def provide_judgement(event):
                 ]
                 response = await selected_client.chat.completions.create(
                     model=judge['openai_model'],
-                    messages=judge_messages,
+                    messages=judge_messages,  # noqa
                     max_tokens=512,
                     temperature=judge['temperature'],
                 )
@@ -282,14 +317,6 @@ async def send_message(msg_obj, msg_txt):
                 await msg_obj.channel.send(chunk)
             except Exception as err:
                 print(f'Error sending message: {err}')
-
-
-async def remove_think_tags(text):
-    """
-    DeepSeek includes the reasoning output in <think></think> tags and we need to remove this for chat responses.
-    """
-    pattern = r'<think>.*?</think>'
-    return re.sub(pattern, '', text, flags=re.DOTALL)
 
 
 def is_youtube_url(text):
@@ -368,6 +395,104 @@ async def download_youtube_as_audio_only(url, start_quality='192'):
     return None
 
 
+async def handle_youtube(message, event):
+    await message.add_reaction('🎵')
+    print('Processing YouTube link...\n', flush=True)
+
+    # Extract YouTube URL from message
+    yt_match_pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})'
+    youtube_urls = re.findall(yt_match_pattern, message.content)
+    if youtube_urls:
+        youtube_url = f'https://youtu.be/{youtube_urls[0]}'
+        audio_file_path = await download_youtube_as_audio_only(youtube_url)
+
+        if audio_file_path:
+            try:
+                await message.channel.send(file=discord.File(audio_file_path))
+                print(f'Successfully uploaded audio file: {audio_file_path}', flush=True)
+            except Exception as err:
+                print(f'Error uploading audio file with initial quality: {err}', flush=True)
+                # Retry with lower quality (128)
+                audio_file_path2 = await download_youtube_as_audio_only(youtube_url, start_quality='128')
+                if audio_file_path2:
+                    try:
+                        await message.channel.send(file=discord.File(audio_file_path2))
+                        print(f'Successfully uploaded audio file on retry: {audio_file_path2}', flush=True)
+                    except Exception as err2:
+                        print(f'Error uploading audio file on retry: {err2}', flush=True)
+                        await message.channel.send('Sorry, there was an error uploading the audio file file.')
+                    finally:
+                        try:
+                            os.remove(audio_file_path2)
+                        except:
+                            pass
+                else:
+                    await message.channel.send('Sorry, I couldn\'t convert that YouTube video to audio file. It might be too long or unavailable.')
+            finally:
+                try:
+                    os.remove(audio_file_path)
+                except:
+                    pass
+        else:
+            await message.channel.send('Sorry, I couldn\'t convert that YouTube video to audio file. It might be too long or unavailable.')
+
+
+async def handle_guidance(message, event):
+    await message.add_reaction('👍')
+    print('Awaiting guidance...\n', flush=True)
+    judgement_response = await provide_judgement(event)
+    await send_message(message, judgement_response)
+
+
+async def handle_online(message, event):
+    await message.add_reaction('👍')
+    print('Searching the interwebs...\n', flush=True)
+    event.update({'channel_model': 'sonar-pro'})
+    if not '+history' in message.content:
+        event.update({'channel_history': ''})
+
+    response, citations = await handle_message(event)
+    await send_message(message, response)
+    if citations and '+citations' in message.content:
+        await send_message(message, citations)
+
+
+async def handle_pal(message, event):
+    await message.add_reaction('👍')
+    print('Handling message...\n', flush=True)
+    if not '+history' in message.content:
+        event.update({'channel_history': ''})
+
+    response, citations = await handle_message(event)
+    await send_message(message, response)
+    if citations and '+citations' in message.content:
+        await send_message(message, citations)
+
+
+command_dispatcher = [
+    {
+        'condition': lambda msg: all([
+            bool(msg.channel.name == 'music'),
+            bool(msg.content.startswith('get ') or msg.content.startswith('!get')),
+            bool(is_youtube_url(msg.content)),
+        ]),
+        'handler': handle_youtube,
+    },
+    {
+        'condition': lambda msg: msg.content.startswith('guidance:') or msg.content.startswith('!guidance'),
+        'handler': handle_guidance,
+    },
+    {
+        'condition': lambda msg: msg.content.startswith('online:') or msg.content.startswith('!online'),
+        'handler': handle_online,
+    },
+    {
+        'condition': lambda msg: msg.content.startswith('hey pal') or msg.channel.name.startswith('pal-'),
+        'handler': handle_pal,
+    },
+]
+
+
 @discord_client.event
 async def on_ready():
     print(f'{discord_client.user} has connected to Discord!', flush=True)
@@ -409,88 +534,11 @@ async def on_message(message):
     except Exception as err:
         print(f'Unable to setup event dictionary: {err}', flush=True)
 
-    # Handle YouTube links
-    yt_conditions = [
-        bool(message.channel.name == 'music'),
-        bool(message.content.startswith('get ') or message.content.startswith('!get')),
-        bool(is_youtube_url(message.content)),
-    ]
-    if all(yt_conditions):
-        await message.add_reaction('🎵')
-        print('Processing YouTube link...\n', flush=True)
-
-        # Extract YouTube URL from message
-        yt_match_pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})'
-        youtube_urls = re.findall(yt_match_pattern, message.content)
-        if youtube_urls:
-            youtube_url = f'https://youtu.be/{youtube_urls[0]}'
-            audio_file_path = await download_youtube_as_audio_only(youtube_url)
-
-            if audio_file_path:
-                try:
-                    await message.channel.send(file=discord.File(audio_file_path))
-                    print(f'Successfully uploaded audio file: {audio_file_path}', flush=True)
-                except Exception as err:
-                    print(f'Error uploading audio file with initial quality: {err}', flush=True)
-                    # Retry with lower quality (128)
-                    audio_file_path2 = await download_youtube_as_audio_only(youtube_url, start_quality='128')
-                    if audio_file_path2:
-                        try:
-                            await message.channel.send(file=discord.File(audio_file_path2))
-                            print(f'Successfully uploaded audio file on retry: {audio_file_path2}', flush=True)
-                        except Exception as err2:
-                            print(f'Error uploading audio file on retry: {err2}', flush=True)
-                            await message.channel.send('Sorry, there was an error uploading the audio file file.')
-                        finally:
-                            try:
-                                os.remove(audio_file_path2)
-                            except:
-                                pass
-                    else:
-                        await message.channel.send('Sorry, I couldn\'t convert that YouTube video to audio file. It might be too long or unavailable.')
-                finally:
-                    try:
-                        os.remove(audio_file_path)
-                    except:
-                        pass
-            else:
-                await message.channel.send('Sorry, I couldn\'t convert that YouTube video to audio file. It might be too long or unavailable.')
-
-        return
-
-    if message.content.startswith('guidance:') or message.content.startswith('!guidance'):
-        await message.add_reaction('👍')
-        print('Awaiting guidance...\n', flush=True)
-        judgement_response = await provide_judgement(event)
-        await send_message(message, judgement_response)
-        return
-
-    if message.content.startswith('online:') or message.content.startswith('!online'):
-        await message.add_reaction('👍')
-        print('Searching the interwebs...\n', flush=True)
-        event.update({'channel_model': 'sonar-pro'})
-        if not '+history' in message.content:
-            event.update({'channel_history': ''})
-
-        response, citations = await handle_message(event)
-        await send_message(message, response)
-        if citations and '+citations' in message.content:
-            await send_message(message, citations)
-
-        return
-
-    if message.content.startswith('hey pal') or message.channel.name.startswith('pal-'):
-        await message.add_reaction('👍')
-        print('Handling message...\n', flush=True)
-        if not '+history' in message.content:
-            event.update({'channel_history': ''})
-
-        response, citations = await handle_message(event)
-        await send_message(message, response)
-        if citations and '+citations' in message.content:
-            await send_message(message, citations)
-
-        return
+    # Dispatch commands using the command dispatcher
+    for command in command_dispatcher:
+        if command['condition'](message):
+            await command['handler'](message, event)
+            break
 
 
 if __name__ == '__main__':
