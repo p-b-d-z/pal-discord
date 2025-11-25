@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 
 import yt_dlp
 import discord
@@ -79,6 +80,10 @@ system_prompt_dict = {
     'default': palpersonalities.default,
     'conservative': palpersonalities.conservative,
     'liberal': palpersonalities.liberal,
+    'utilitarian': palpersonalities.utilitarian,
+    'legal_expert': palpersonalities.legal_expert,
+    'medical_expert': palpersonalities.medical_expert,
+    'environmental_expert': palpersonalities.environmental_expert,
     'online': palpersonalities.online,
     'neutral': palpersonalities.neutral,
 }
@@ -204,93 +209,219 @@ async def handle_message(event):
         return '', []
 
 
-async def provide_judgement(event):
-    message_text = event.get('message', '')
-    # channel_model = event.get('channel_model', '')
+# Global judgement cache
+judgement_cache = {}
+
+def get_cache_key(message_text):
+    return hashlib.md5(message_text.encode()).hexdigest()
+
+async def check_judgement_cache(message_text):
+    key = get_cache_key(message_text)
+    if key in judgement_cache:
+        cache_entry = judgement_cache[key]
+        if time.time() - cache_entry['timestamp'] < 3600:  # 1 hour
+            return cache_entry['result']
+    return None
+
+def select_expert_judges(message_text):
     judges = [
         {
+            'name': 'conservative',
             'prompt': palpersonalities.conservative,
             'openai_base_url': akash_base_url,
-            'openai_model': 'nvidia-Llama-3-1-Nemotron-70B-Instruct-HF',
+            'openai_model': 'DeepSeek-R1-Distill-Qwen-32B',
             'temperature': 0.3,
         },
         {
+            'name': 'liberal',
             'prompt': palpersonalities.liberal,
             'openai_base_url': akash_base_url,
-            'openai_model': 'Meta-Llama-3-2-3B-Instruct',
+            'openai_model': 'Meta-Llama-3-3-70B-Instruct',
             'temperature': 0.7
         },
+        {
+            'name': 'utilitarian',
+            'prompt': palpersonalities.utilitarian,
+            'openai_base_url': akash_base_url,
+            'openai_model': 'Meta-Llama-4-Maverick-17B-128E-Instruct-FP8',
+            'temperature': 0.5,
+        },
     ]
+
+    # Add expert judges based on content
+    if 'legal' in message_text.lower() or 'law' in message_text.lower() or 'court' in message_text.lower():
+        judges.append({
+            'name': 'legal_expert',
+            'prompt': palpersonalities.legal_expert,
+            'openai_base_url': akash_base_url,
+            'openai_model': 'Qwen3-235B-A22B-Instruct-2507-FP8',
+            'temperature': 0.4,
+        })
+    if 'medical' in message_text.lower() or 'health' in message_text.lower() or 'patient' in message_text.lower():
+        judges.append({
+            'name': 'medical_expert',
+            'prompt': palpersonalities.medical_expert,
+            'openai_base_url': akash_base_url,
+            'openai_model': 'DeepSeek-V3-1',
+            'temperature': 0.4,
+        })
+    if 'environmental' in message_text.lower() or 'climate' in message_text.lower() or 'ecology' in message_text.lower():
+        judges.append({
+            'name': 'environmental_expert',
+            'prompt': palpersonalities.environmental_expert,
+            'openai_base_url': akash_base_url,
+            'openai_model': 'gpt-oss-120b',
+            'temperature': 0.4,
+        })
+
+    return judges
+
+async def get_single_judgement(judge, message_text):
+    try:
+        use_akash = bool('akash' in judge['openai_base_url'])
+        selected_client = akash_client if use_akash else openai_client
+
+        judge_messages = [
+            {'role': 'system', 'content': judge['prompt']},
+            {'role': 'user', 'content': message_text},
+        ]
+        response = await selected_client.chat.completions.create(
+            model=judge['openai_model'],
+            messages=judge_messages,  # noqa
+            max_tokens=512,
+            temperature=judge['temperature'],
+        )
+
+        result = response.choices[0].message.content or ""
+        print(f'{judge["name"]} judgement: {result}', flush=True)
+
+        # Parse confidence
+        confidence_match = re.search(r'Confidence: (\d+)/10', result)
+        confidence = int(confidence_match.group(1)) if confidence_match else 5
+
+        return {'content': result, 'confidence': confidence, 'name': judge['name']}
+
+    except Exception as err:
+        print(f'Error getting judgement from {judge["name"]}: {err}', flush=True)
+        return {'content': f'Unable to obtain judgement from {judge["name"]}.', 'confidence': 1, 'name': judge['name']}
+
+async def get_judge_responses(judges, message_text):
+    tasks = []
+    for judge in judges:
+        task = asyncio.create_task(get_single_judgement(judge, message_text))
+        tasks.append(task)
+
+    return await asyncio.gather(*tasks)
+
+def detect_consensus(judgements, threshold=0.8):
+    if len(judgements) < 2:
+        return False
+
+    # Simple consensus: all judges agree on positive/negative outcome
+    sentiments = []
+    for judgement in judgements:
+        content = judgement['content'].lower()
+        if 'approve' in content or 'good' in content or 'acceptable' in content:
+            sentiments.append(1)
+        elif 'disapprove' in content or 'bad' in content or 'unacceptable' in content:
+            sentiments.append(-1)
+        else:
+            sentiments.append(0)
+
+    agreement_ratio = sentiments.count(sentiments[0]) / len(sentiments) if sentiments else 0
+    return agreement_ratio >= threshold and sentiments[0] != 0
+
+async def get_final_judgement(judgements, message_text):
     final_judge = {
-        'prompt': palpersonalities.neutral,
-        'openai_base_url': akash_base_url,
-        'openai_model': 'Meta-Llama-3-3-70B-Instruct',
-        'temperature': 0.5,
+        'prompt': palpersonalities.online,
+        'openai_base_url': openai_base_url,
+        'openai_model': 'sonar-pro',
+        'temperature': 0.4,
     }
-    judgements = []
-    if message_text:
+
+    # Combine judgements with confidence scores
+    judgement_context = '# Purpose\nAnalyze the judgement statement and the provided judgements below. Formulate a final evidence-based judgement.\n'
+    judgement_context += f'# Judgement Statement\n{message_text}\n'
+
+    for judgement in judgements:
+        judgement_context += f'# Judgement from {judgement["name"]} (Confidence: {judgement["confidence"]}/10)\n'
+        judgement_context += judgement['content'] + '\n'
+
+    try:
+        print(f'\nFinal Judge Context:\n{judgement_context}\n', flush=True)
+        use_akash = bool('akash' in final_judge['openai_base_url'])
+        selected_client = akash_client if use_akash else openai_client
+
+        final_messages = [
+            {'role': 'system', 'content': final_judge['prompt']},
+            {'role': 'user', 'content': judgement_context},
+        ]
+        judgement_response = await selected_client.chat.completions.create(
+            model=final_judge['openai_model'],
+            messages=final_messages,  # noqa
+            max_tokens=512,
+            temperature=final_judge['temperature'],
+        )
+
+        judgement_result = judgement_response.choices[0].message.content
+        print(f'\nFinal judgement response:\n{judgement_result}\n', flush=True)
+        return judgement_result
+
+    except Exception as err:
+        print(f'Error getting final judgement: {err}', flush=True)
+        return 'Unable to formulate final judgement due to technical issues.'
+
+async def provide_judgement(event):
+    message_text = event.get('message', '')
+    if not message_text:
+        return 'No judgement statement provided.'
+
+    # Check cache first
+    cached_result = await check_judgement_cache(message_text)
+    if cached_result:
+        print('Returning cached judgement', flush=True)
+        return cached_result
+
+    try:
+        # Select judges based on content
+        judges = select_expert_judges(message_text)
+
+        # Get judgements in parallel
+        print(f'Starting judgement process with {len(judges)} judges...', flush=True)
+        judgements = await get_judge_responses(judges, message_text)
+
+        if not judgements:
+            return "Unable to gather sufficient judgements."
+
+        # Check for consensus
+        if detect_consensus(judgements):
+            print('Consensus detected, returning first judge opinion', flush=True)
+            result = judgements[0]['content']
+        else:
+            # Get final judgement from online judge
+            result = await get_final_judgement(judgements, message_text)
+
+        # Cache the result
+        key = get_cache_key(message_text)
+        judgement_cache[key] = {'result': result, 'timestamp': time.time()}
+
+        return result
+
+    except Exception as err:
+        print(f'Judgement system error: {err}', flush=True)
+        # Fallback to single judge mode
         try:
-            for judge in judges:
-                print('Judging...', flush=True)
-                use_akash = bool('akash' in judge['openai_base_url'])
-                if use_akash:
-                    selected_client = akash_client
-                else:
-                    selected_client = openai_client
-
-                judge_messages = [
-                    {'role': 'system', 'content': judge['prompt']},
-                    {'role': 'user', 'content': message_text},
-                ]
-                response = await selected_client.chat.completions.create(
-                    model=judge['openai_model'],
-                    messages=judge_messages,  # noqa
-                    max_tokens=512,
-                    temperature=judge['temperature'],
-                )
-
-                result = response.choices[0].message.content
-                print(f'judgement response: {result}', flush=True)
-                judgements.append(result)
-
-        except Exception as err:
-            print(f'error: {err}', flush=True)
-            return ''
-
-        # Combine judgements
-        judgement_context = '# Purpose\nAnalyze the judgement statement and the provided judgements below. Formulate a final judgement.\n'
-        judgement_context += f'# Judgement Statement\n{message_text}\n'
-        for context in judgements:
-            judgement_context += '# Judgement Provided\n'
-            judgement_context += context + '\n'
-
-        try:
-            print(f'\nJudgement Context:\n{judgement_context}\n', flush=True)
-            use_akash = bool('akash' in final_judge['openai_base_url'])
-            if use_akash:
-                selected_client = akash_client
-            else:
-                selected_client = openai_client
-
-            final_messages = [
-                cast(ChatCompletionSystemMessageParam,
-                     cast(object, {'role': 'system', 'content': final_judge['prompt']})),
-                cast(ChatCompletionUserMessageParam, cast(object, {'role': 'user', 'content': judgement_context})),
-            ]
-            judgement_response = await selected_client.chat.completions.create(
-                model=final_judge['openai_model'],
-                messages=final_messages,
-                max_tokens=512,
-                temperature=final_judge['temperature'],
-            )
-
-            judgement_result = judgement_response.choices[0].message.content
-            print(f'\nfinal response:\n{judgement_result}\n', flush=True)
-            return judgement_result
-
-        except Exception as err:
-            print(f'error: {err}', flush=True)
-            return ''
+            fallback_judge = {
+                'name': 'fallback',
+                'prompt': palpersonalities.neutral,
+                'openai_base_url': akash_base_url,
+                'openai_model': 'Meta-Llama-3-3-70B-Instruct',
+                'temperature': 0.5,
+            }
+            fallback_result = await get_single_judgement(fallback_judge, message_text)
+            return fallback_result['content']
+        except:
+            return "Judgement system temporarily unavailable."
 
 
 async def get_channel_messages(event, limit=10):
@@ -468,7 +599,6 @@ async def handle_pal(message, event):
     if citations and '+citations' in message.content:
         await send_message(message, citations)
 
-
 command_dispatcher = [
     {
         'condition': lambda msg: all([
@@ -479,7 +609,7 @@ command_dispatcher = [
         'handler': handle_youtube,
     },
     {
-        'condition': lambda msg: msg.content.startswith('guidance:') or msg.content.startswith('!guidance'),
+        'condition': lambda msg: msg.content.startswith(('guidance:', '!guidance', 'judgement:', '!judgement')),
         'handler': handle_guidance,
     },
     {
